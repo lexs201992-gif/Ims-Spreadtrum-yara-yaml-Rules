@@ -1,0 +1,77 @@
+name: Android_Unisoc_SupplyChain_Longcheer
+description: |
+  Detecta componentes comprometidos de Unisoc/Longcheer (T606) y verifica 
+  si la fecha del binario es anterior al parche de seguridad reportado (Spoofing).
+  Incluye IOCs específicos: Certificado Longcheer, Hash APK, Trigger LCD.
+  
+author: "Alex de la cruz"
+parameters:
+  - name: YaraRule
+    type: yara
+    default: |
+      rule Android_Unisoc_SupplyChain_Longcheer {
+          meta: severity = "Critical"
+          strings:
+              $cert_longcheer = "22:85:26:b0:d1:ef:90:c3:b8:ed:56:8a:49:c3:71:4f:6a:39:50:6b" ascii wide
+              $sha_ims_apk = "1b938cb3920d601a38e4d08e88c37aaacc56abfa6464f3054de2430172c6f519" ascii wide
+              $lcd_trigger = "lcd_td4168" ascii wide
+              $wireguard_kmod = "WireGuard 1.0.0 loaded" ascii wide
+              $lib_ims_name = "libismsEx.so" ascii
+              $ext_hal_convert = "convertToHalDataProfile" ascii wide
+              $pkg_sgps = "com/spreadtrum/sgps" ascii wide
+              $elf_header = { 7F 45 4C 46 }
+          condition:
+              ( $cert_longcheer and $sha_ims_apk ) or 
+              ( $elf_header at 0 and $lib_ims_name and $ext_hal_convert ) or
+              ( $lcd_trigger and $wireguard_kmod ) or
+              ( $pkg_sgps )
+      }
+  - name: PatchDateReported
+    type: string
+    description: "Fecha de parche de seguridad reportada por el dispositivo (ro.build.version.security_patch)"
+    default: "2026-04-06"
+  - name: TargetFiles
+    type: string
+    description: "Archivos críticos a verificar"
+    default: |
+      /system/lib64/libismsEx.so
+      /system/priv-app/com.spreadtrum.sgps/*.apk
+      /vendor/etc/build.prop
+      /sys/class/graphics/fb0/mode  # Posible ubicación de info LCD
+
+sources:
+  - query: |
+      // 1. Escaneo YARA inicial
+      LET yara_hits <= SELECT * FROM yara(
+          rules=YaraRule, 
+          globs=TargetFiles, 
+          accessor="auto"
+      )
+
+      // 2. Obtener metadatos de tiempo (Mtime) de los archivos críticos
+      LET file_stats <= SELECT 
+          FullPath, 
+          Mtime, 
+          Size, 
+          Hash.MD5, 
+          Hash.SHA256
+      FROM glob(globs="/system/lib64/libismsEx.so") 
+      WHERE Mtime < PatchDateReported
+
+      // 3. Correlación Final: ¿Coincide YARA y la fecha es sospechosa?
+      SELECT 
+          y.FullPath AS FileDetected,
+          y.Rule AS RuleMatched,
+          y.Strings AS MatchedIOCs,
+          f.Mtime AS FileModificationTime,
+          PatchDateReported AS ReportedPatchDate,
+          IF(
+             Condition=f.Mtime < PatchDateReported, 
+             Then="CRITICAL: SPOOFING DETECTED (File older than patch)", 
+             Else="WARNING: Vulnerable component present"
+          ) AS Verdict,
+          f.Hash.SHA256 AS ActualSHA256
+      FROM yara_hits AS y
+      LEFT JOIN file_stats AS f
+      ON y.FullPath = f.FullPath
+      WHERE MatchedIOCs =~ "cert_longcheer|sha_ims_apk|libismsEx|lcd_trigger"
